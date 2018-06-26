@@ -1,0 +1,22 @@
+{
+    "name": "mz/mockredis",
+    "description": "An in-memory, pure-PHP implementation of Redis.",
+    "license": "BSD-3-Clause",
+    "keywords": ["redis"],
+    "homepage": "https://github.com/machinezone/mockredis",
+    "authors": [{
+        "name": "Garth Gillespie",
+        "email": "garth@mz.com"
+    }],
+    "require": {
+        "php": ">=7.0"
+    },
+    "autoload": {
+        "psr-4": {"mz\\mockredis\\": "src/"}
+    },
+    "bin": [
+        "bin/mockredis",
+        "bin/mockredis-cli",
+        "bin/mockredis-server"
+     ]
+}

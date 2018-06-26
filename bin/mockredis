@@ -1,0 +1,515 @@
+#!/usr/bin/env php
+<?php // Copyright (c) 2017-2018 Machine Zone, Inc. All rights reserved.
+
+require_once __DIR__.'/../src/include.php';
+
+// TODO: move these to classes
+
+/**
+ * Parse an a human request (i.e. from cli or telnet) into command arguments.
+ *
+ * @param string $line The command line
+ * @return string[]    The command arguments
+ */
+function mockredis_sdssplitargs($line) {
+    // this is sorta awkward in PHP, but we don't care if this debugging code
+    // is awkward or slow.
+    $args = [];
+    $len = strlen($line);
+    $pos = 0;
+    while ($pos < $len) {
+        $pos += strspn($line, " \n\r\t\0", $pos); // technically should be isspace
+        if ($pos >= $len) {
+            return $args;
+        }
+        unset($arg);
+        $arg = '';
+        $args[] = &$arg;
+        $char = $line[$pos];
+        if ($char != '"' && $char != "'") {
+            $span = strcspn($line, " \n\r\t\0\"'", $pos);
+            $arg .= substr($line, $pos, $span);
+            $pos += $span;
+            if ($pos >= $len) {
+                return $args;
+            }
+            $char = $line[$pos];
+        }
+        if ($char == '"') {
+            $pos++;
+            while (true) {
+                $span = strcspn($line, '"\\', $pos);
+                $arg .= substr($line, $pos, $span);
+                $pos += $span;
+                if ($pos >= $len) {
+                    return false;
+                } elseif ($line[$pos] == '"') {
+                    $pos++;
+                    if ($pos >= $len) {
+                        return $args;
+                    } elseif ($line[$pos] == ' ') {
+                        break;
+                    } else {
+                        return false;
+                    }
+                } elseif ($line[$pos] == '\\') {
+                    $pos++;
+                    if ($pos >= $len) {
+                        return false;
+                    }
+                    switch ($line[$pos]) {
+                        case 'n': $arg .= "\n";        break;
+                        case 'r': $arg .= "\r";        break;
+                        case 't': $arg .= "\t";        break;
+                        case 'b': $arg .= "\x07";      break;
+                        case 'a': $arg .= "\x08";      break;
+                        default:  $arg .= $line[$pos]; break;
+
+                        case 'x':
+                            $pos++;
+                            $xord = substr($line, $pos, 2);
+                            if (ctype_xdigit($xord) && strlen($xord) == 2) {
+                                $pos += 2;
+                                $arg .= chr(hexdec($xord));
+                            } else {
+                                $arg .= 'x';
+                            }
+                            break;
+                    }
+                } else {
+                    throw new Exception("Unexpected character?");
+                }
+            }
+        } elseif ($char == "'") {
+            $pos++;
+            while (true) {
+                $span = strcspn($line, "'\\", $pos);
+                $arg .= substr($line, $pos, $span);
+                $pos += $span;
+                if ($pos >= $len) {
+                    return false;
+                } elseif ($line[$pos] == "'") {
+                    $pos++;
+                    if ($pos >= $len) {
+                        return $args;
+                    } elseif ($line[$pos] == ' ') {
+                        break;
+                    } else {
+                        return false;
+                    }
+                } elseif ($line[$pos] == '\\') {
+                    $pos++;
+                    if ($pos >= $len) {
+                        return false;
+                    } elseif ($line[$pos] != "'") {
+                        $arg .= '\\';
+                    } else {
+                        $pos++;
+                        $arg .= "'";
+                    }
+                } else {
+                    throw new Exception("Unexpected character?");
+                }
+            }
+        }
+    }
+    return $args;
+}
+
+/**
+ * Execute a single Redis command, but return errors instead of throwing them.
+ *
+ * @param MockRedis $redis The server state
+ * @param string[] $args   The command arguments
+ * @return mixed           The result
+ */
+function mockredis_app_command($redis, $args) {
+    try {
+        $command = array_shift($args);
+        return $redis->$command(...$args);
+    } catch(Throwable $e) {
+        return $e;
+    }
+}
+
+/**
+ * Print a command result as redis-cli would.
+ *
+ * @param mixed $result  The command result
+ * @param string $indent Line indentation (recursively, for nested results)
+ * @return bool          Whether the result was a successful one
+ */
+function mockredis_cli_print($result, $indent='') {
+    if ($result instanceof mz\mockredis\MockRedisException) {
+        $result = $result->getMessage();
+        echo "(error) $result\n";
+        return false;
+    } elseif ($result instanceof Throwable) {
+        $result = $result->getMessage();
+        echo "(PHP error) $result\n";
+        return false;
+    }
+
+    if ($result === mz\mockredis\MockRedis::OK) {
+        echo "OK\n";
+    } elseif ($result === mz\mockredis\MockRedis::PONG) {
+        // FIXME: this may convert a bulk "PONG" to a status
+        echo "PONG\r\n";
+    } elseif ($result === mz\mockredis\MockRedis::nil) {
+        echo "(nil)\n";
+    } elseif (is_integer($result)) {
+        echo "(integer) $result\n";
+    } elseif (is_float($result)) {
+        $result = is_infinite($result) ? strtolower($result) : (string)$result;
+        echo "\"$result\"\n";
+    } elseif (is_string($result)) {
+        // octal escapes instead of hex escapes... close enough ;P
+        $result = addcslashes($result, "\0..\37\\\"\177..\377");
+        echo "\"$result\"\n";
+    } elseif (is_array($result)) {
+        $count = count($result);
+        if (!$count) {
+            echo "(empty list or set)\n";
+        } else {
+            $s = ceil(log10($count+1));
+            $format = "% ${s}d) ";
+            $i = 0;
+            foreach ($result as $v) {
+                echo sprintf($format, ++$i);
+                if ($i == 1) {
+                    $format = $indent.$format;
+                    $indent .= str_pad('', $s+2);
+                }
+                mockredis_cli_print($v, $indent);
+            }
+        }
+    } else {
+        throw new Exception("Unexpected result type ".mz\mockredis\MockRedis::PhpType($result));
+    }
+    return true;
+}
+
+/**
+ * Execute a single Redis command and print the result as redis-cli would.
+ *
+ * @param MockRedis $redis The server state
+ * @param string[] $args   The command arguments
+ * @return bool            Whether the command was handled successfully
+ */
+function mockredis_cli_command($redis, $args) {
+    return mockredis_cli_print(mockredis_app_command($redis, $args));
+}
+
+/**
+ * Run as a mock redis-cli client.
+ *
+ * @param string[] $args Command line arguments, as $argv but not including 0
+ * @return int           Exit code
+ */
+function mockredis_cli_main($args) {
+    $dir      = "$_SERVER[HOME]/.mockredis";
+    $histfile = "$_SERVER[HOME]/.mockredis_history";
+
+    if (!is_dir($dir)) {
+        mkdir($dir);
+    }
+
+    $persistence = new mz\mockredis\JsonMockRedisPersistence($dir);
+    $redis = new mz\mockredis\MockRedis('cli', $persistence);
+
+    if (count($args)) {
+        // command mode
+        return mockredis_cli_command($redis, $args) ? 0 : 3;
+    } else {
+        // interactive mode
+        $histfile = $_SERVER['HOME']."/.mockredis_history";
+        readline_read_history($histfile);
+        while (true) {
+            $line = readline('mockredis> ');
+            if ($line === false) {
+                break;
+            }
+            $args = mockredis_sdssplitargs($line);
+            if ($args === false) {
+                echo "Invalid argument(s)\n";
+            } elseif ($args) {
+                if (strtoupper($args[0]) == 'QUIT') {
+                    break;
+                }
+                readline_add_history($line);
+                mockredis_cli_command($redis, $args);
+            }
+        }
+        readline_write_history($histfile);
+        return 0;
+    }
+}
+
+/**
+ * Convert a command result to a Redis Serialization Protocol response.
+ *
+ * @param mixed $result The command result
+ * @return string       The serialized response
+ */
+function mockredis_server_response($result) {
+    if ($result instanceof mz\mockredis\MockRedisException) {
+        $error = $result->getMessage();
+        return "-$error\r\n";
+    } elseif ($result instanceof Throwable) {
+        $error = $result->getMessage();
+        return "-PHP $error\r\n";
+    } elseif ($result === mz\mockredis\MockRedis::OK) {
+        return "+OK\r\n";
+    } elseif ($result === mz\mockredis\MockRedis::PONG) {
+        // FIXME: this may convert a bulk "PONG" to a status
+        return "+PONG\r\n";
+    } elseif ($result === mz\mockredis\MockRedis::nil) {
+        return "\$-1\r\n";
+    } elseif (is_integer($result)) {
+        return ":$result\r\n";
+    } elseif (is_float($result)) {
+        $result = is_infinite($result) ? strtolower($result) : (string)$result;
+        $length = strlen($result);
+        return "\$$length\r\n$result\r\n";
+    } elseif (is_string($result)) {
+        $length = strlen($result);
+        return "\$$length\r\n$result\r\n";
+    } elseif (is_array($result)) {
+        $count = count($result);
+        $response = "*$count\r\n";
+        foreach ($result as $value) {
+            $response .= mockredis_server_response($value);
+        }
+        return $response;
+    } else {
+        throw new Exception("Unexpected result type ".gettype($result));
+    }
+}
+
+/**
+ * Consume and parse a request using the Redis Serialization Protocol.
+ *
+ * @param resource $client          The client socket
+ * @param string $line              The first line
+ * @return array|MockRedisException The request arguments or an error
+ */
+function mockredis_server_parserequest($client, $line) {
+    if ($line[0] != '*') {
+        return new mz\mockredis\MockRedisException("ERR Protocol error: expected '*', got '$line[0]'");
+    }
+    if (substr($line, -2) != "\r\n") {
+        return new mz\mockredis\MockRedisException("ERR Protocol error: bad CRLF");
+    }
+
+    $count = (int)substr($line, 1, -2);
+    if ($count > 1024*1024) {
+        return new mz\mockredis\MockRedisException("ERR Protocol error: invalid multibulk length");
+    }
+
+    $args = [];
+    for ($i = 0; $i < $count; $i++) { 
+        // bulk string length
+        $line = fgets($client);
+        if ($line === false) {
+            return false;
+        }
+        if ($line[0] != '$') {
+            return new mz\mockredis\MockRedisException("ERR Protocol error: expected '$', got '$line[0]'");
+        }
+        if (substr($line, -2) != "\r\n") {
+            return new mz\mockredis\MockRedisException("ERR Protocol error: bad CRLF");
+        }
+        $length = substr($line, 1, -2);
+        if (!ctype_digit($length) || !$length < 0 || $length > 512*1024*1024) {
+            return new mz\mockredis\MockRedisException("ERR Protocol error: invalid bulk length");
+        }
+
+        // string data
+        $arg = '';
+        while ($length > 0) {
+            $bytes = fread($client, $length);
+            if ($bytes === false) {
+                return false;
+            }
+            $length -= strlen($bytes);
+            $arg .= $bytes;
+        }
+
+        // final CRLF
+        $line = fgets($client);
+        if ($line === false) {
+            return false;
+        }
+        if ($line != "\r\n") {
+            return new mz\mockredis\MockRedisException("ERR Protocol error: bad CRLF");
+        }
+
+        $args[] = $arg;
+    }
+    return $args;
+}
+
+/**
+ * Handle a single request from a client.
+ *
+ * @param MockRedis $redis The server state
+ * @param resource $client The client socket
+ * @return bool            Whether the command was handled
+ */
+function mockredis_server_recv($redis, $client) {
+    $line = fgets($client, 64*1024);
+    if ($line === false) {
+        return false;
+    }
+    // FIXME: this should only be decided once
+    if ($line[0] == '*') {
+        // redis-style
+        $args = mockredis_server_parserequest($client, $line);
+    } else {
+        // telnet-style
+        if (substr($line, -2) != "\r\n") {
+            $args = new mz\mockredis\MockRedisException("ERR Protocol error: too big inline request");
+        } else {
+            $args = mockredis_sdssplitargs($line);
+            if ($args === false) {
+                $args = new mz\mockredis\MockRedisException("ERR Protocol error: unbalanced quotes in request");
+            }
+        }
+    }
+    if (!$args) {
+        return true;
+    }
+    // protocol errors
+    if ($args instanceof mz\mockredis\MockRedisException) {
+        $response = mockredis_server_response($args);
+        fwrite($client, $response); // doesn't matter if this fails
+        return false;
+    }
+
+    // special handling for QUIT, we don't want to shutdown $redis, but we do
+    // want a graceful disconnect of the client.
+    if (strtoupper($args[0]) == 'QUIT') {
+        $response = mockredis_server_response(mz\mockredis\MockRedis::OK);
+        fwrite($client, $response); // doesn't matter if this fails
+        return false;
+    }
+
+    $response = mockredis_server_response(mockredis_app_command($redis, $args));
+    if (fwrite($client, $response) === false) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Run as a mock redis-server daemon (does not return).
+ *
+ * @param string[] $args Command line arguments, as $argv but not including 0
+ */
+function mockredis_server_main($args) {
+    $dir = "$_SERVER[HOME]/.mockredis";
+
+    $config = [
+        'bind' => '127.0.0.1',
+        'port' => 6379,
+    ];
+
+    if (!is_dir($dir)) {
+        mkdir($dir);
+    }
+
+    // TODO: validate config values, syntax, etc
+    if ($args && is_file($args[0])) {
+        $conf = file_get_contents($args[0]);
+        if (preg_match_all('/^\s*(\S+)\s*([^#\n]*)\s*(?:#|$)/m', $conf, $match, PREG_SET_ORDER)) {
+            foreach ($match as $m) {
+                $config[$m[1]] = $m[2];
+            }
+        }
+    }
+
+    echo "mockredis-server\n";
+
+    $pid = (string)getmypid();
+    echo "PID: $pid\n";
+    if (isset($config['pidfile'])) {
+        @file_put_contents($config['pidfile'], "$pid\n");
+    }
+
+    // TODO: make other backends configurable
+    $persistence = null; // new mz\mockredis\SerializeMockRedisPersistence($dir);
+    $redis = new mz\mockredis\MockRedis("server-$config[port]", $persistence);
+
+    $server = stream_socket_server("tcp://$config[bind]:$config[port]");
+
+    echo "The server is now ready to accept connections on port $config[port]\n";
+
+    $clients = [];
+    $null = null;
+    while(true) {
+        $read = $clients;
+        $read[] = $server;
+        if (stream_select($read, $null, $null, null)) {
+            foreach ($read as $client) {
+                if ($client == $server) {
+                    $client = stream_socket_accept($server, 0);
+                    if ($client !== false) {
+                        $clients[(string)$client] = $client;
+                    }
+                } else {
+                    if (!mockredis_server_recv($redis, $client)) {
+                        fclose($client);
+                        unset($clients[(string)$client]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// convert all php errors to redis errors, unless @ is used
+function mockredis_error_handler($severity, $message, $file, $line) {
+    if (error_reporting()) { // if not fully suppressed
+        $file = basename($file);
+        throw new mz\mockredis\MockRedisException("PHP $file:$line: $message");
+    }
+}
+
+/**
+ * Route execution to cli or server main function.
+ *
+ * @param string[] $args Command line arguments (equivalent to $argv)
+ * @return int           Exit code
+ */
+function main($args) {
+    // use more precise float-to-string conversion
+    ini_set('precision', -1); // the php default here is lossy
+    ini_set('serialize_precision', -1); // but might as well be consistent
+
+    set_error_handler('mockredis_error_handler');
+
+    if ($args) {
+        $mode = basename(array_shift($args));
+        if ($mode == 'mockredis' && $args) {
+            $mode .= '-'.array_shift($args);
+        }
+
+        switch ($mode) {
+            case 'mockredis-cli':
+            case 'redis-cli':
+                return mockredis_cli_main($args);
+
+            case 'mockredis-server':
+            case 'redis-server':
+                return mockredis_server_main($args);
+        }
+    }
+
+    file_put_contents('php://stderr', "Could not determine execution mode\nUsage: mockredis <cli|server> [options...]\n");
+    return 3;
+}
+
+if (php_sapi_name() == 'cli' && !count(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 1))) {
+    exit(main($argv));
+}
