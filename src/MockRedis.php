@@ -1555,7 +1555,7 @@ INFO;
         } else {
             $count = self::ParseInt($count);
             $result = [];
-            for ($i = 0; $i < $count && count($set); $i++) { 
+            for ($i = 0; $i < $count && count($set); $i++) {
                 $result[] = array_pop($set);
             }
             return $result;
@@ -2507,6 +2507,9 @@ INFO;
             return INF;
         } elseif ($value === '-inf') {
             return -INF;
+        }
+        if (is_int($value) || is_float($value)) {
+            return (float)$value;
         }
         if (!is_numeric($value) || $value[0] == ' ') {
             throw self::ErrorReply("ERR $name is not a valid float or out of range");
