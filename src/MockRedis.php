@@ -1137,6 +1137,9 @@ LUA_INIT;
         if ($numkeys > count($args)) {
             throw self::ErrorReply("ERR Number of keys can't be greater than number of args");
         }
+        // cast arguments to string to match redis api requirements
+        $args = array_map('strval', $args);
+
         $keys = array_slice($args, 0, $numkeys);
         $argv = array_slice($args, $numkeys);
 
